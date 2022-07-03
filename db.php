@@ -17,7 +17,7 @@ const ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 const PAGE_SIZE = 4096;
 const TABLE_MAX_PAGES = 100;
-const ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
+const ROWS_PER_PAGE = (PAGE_SIZE - PAGE_SIZE % ROW_SIZE) / ROW_SIZE;
 const TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 const PAGE_FILE_PREFIX = "page";
@@ -93,7 +93,7 @@ class Table
 	}
 
 	public function new_page(int $n) {
-		$this->pages[$n] = fopen("php://temp", "r+");	
+		$this->pages[$n] = fopen("php://memory", "r+");	
 	}
 }
 
@@ -228,7 +228,7 @@ function row_slot(Table $table, int $row_num): int {
 		exit(EXIT_FAILURE);
 	}
 
-	$page_num = $row_num - $row_num % ROWS_PER_PAGE;
+	$page_num = $row_num / ROWS_PER_PAGE;
 	if (!isset($table->pages[$page_num])) {
 		$table->new_page($page_num);
 	}
