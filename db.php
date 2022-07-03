@@ -7,7 +7,7 @@ const COLUMN_ID_SIZE = 19;
 const COLUMN_USERNAME_SIZE = 32;
 const COLUMN_EMAIL_SIZE = 255;
 
-const ID_SIZE = COLUMN_ID_SIZE + 1;
+const ID_SIZE = COLUMN_ID_SIZE;
 const USERNAME_SIZE = COLUMN_USERNAME_SIZE + 1;
 const EMAIL_SIZE = COLUMN_EMAIL_SIZE + 1;	 // +1 must be 
 const ID_OFFSET = 0;
@@ -20,8 +20,6 @@ const TABLE_MAX_PAGES = 100;
 const ROWS_PER_PAGE = (PAGE_SIZE - PAGE_SIZE % ROW_SIZE) / ROW_SIZE;
 const TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
-const PAGE_FILE_PREFIX = "page";
-const PAGE_FILE_SUFFIX = ".data";
 const FSEEK_FAILED = -1;
 
 enum MetaCommandResult 
@@ -93,7 +91,7 @@ class Table
 	}
 
 	public function new_page(int $n) {
-		$this->pages[$n] = fopen("php://memory", "r+");	
+		$this->pages[$n] = fopen("php://temp", "r+");	
 	}
 }
 
@@ -228,7 +226,7 @@ function row_slot(Table $table, int $row_num): int {
 		exit(EXIT_FAILURE);
 	}
 
-	$page_num = $row_num / ROWS_PER_PAGE;
+	$page_num = floor($row_num / ROWS_PER_PAGE);
 	if (!isset($table->pages[$page_num])) {
 		$table->new_page($page_num);
 	}
@@ -236,7 +234,7 @@ function row_slot(Table $table, int $row_num): int {
 	$row_offset = $row_num % ROWS_PER_PAGE;
 	$byte_offset = $row_offset * ROW_SIZE;
 	if (fseek($table->pages[$page_num], $byte_offset, SEEK_SET) === FSEEK_FAILED) {
-		echo "fseek failed on page ", $page_num, PHP_EOL;
+		echo "fseek failed on page ", $page_num, " row ", $row_num, " row_offset ", $row_offset, " byte_offset ", $byte_offset, PHP_EOL;
 		exit(EXIT_FAILURE);
 	} else {
 		return $page_num;
