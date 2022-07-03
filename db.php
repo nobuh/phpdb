@@ -71,17 +71,6 @@ class Row
 	public ?string $email;		
 }
 
-class RowPointer
-{
-	public int $page_num;
-	public int $offset;
-
-	public function __construct($p, $o) {
-		$this->page_num = $p;
-		$this->offset = $o;
-	}
-}
-
 class Statement
 {
 	public ?StatementType $type;
@@ -104,7 +93,7 @@ class Table
 	}
 
 	public function new_page(int $n) {
-		$this->pages[$n] = fopen(PAGE_FILE_PREFIX . (string)$n . PAGE_FILE_SUFFIX, "c+");	
+		$this->pages[$n] = fopen("php://temp", "r+");	
 	}
 }
 
@@ -239,7 +228,7 @@ function row_slot(Table $table, int $row_num): int {
 		exit(EXIT_FAILURE);
 	}
 
-	$page_num = $row_num / ROWS_PER_PAGE;
+	$page_num = $row_num - $row_num % ROWS_PER_PAGE;
 	if (!isset($table->pages[$page_num])) {
 		$table->new_page($page_num);
 	}
