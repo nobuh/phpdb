@@ -1,4 +1,4 @@
-# letsdb.php
+# phpdb
 
 Trying implementing https://cstack.github.io/db_tutorial/ in PHP
 
