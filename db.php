@@ -33,6 +33,8 @@ enum MetaCommandResult
 enum PrepareResult
 {
 	case PREPARE_SUCCESS;
+	case PREPARE_NEGATIVE_ID;
+	case PREPARE_STRING_TOO_LONG;
 	case PREPARE_SYNTAX_ERROR;
 	case PREPARE_UNRECOGNIZED_STATEMENT;
 }
@@ -136,18 +138,38 @@ function do_meta_command(InputBuffer $input_buffer): MetaCommandResult {
 	}
 }
 
+function prepare_insert(InputBuffer $input_buffer, Statement $statement): PrepareResult {
+	$statement->type = StatementType::STATEMENT_INSERT;
+
+	$keyword = strtok($input_buffer->buffer, " ");
+	$id_string = strtok(" ");
+	$username = strtok(" ");
+	$email = strtok(" ");
+
+	if ($id_string === null || $username === null || $email === null) {
+		return PrepareResult::PREPARE_SYNTAX_ERROR;
+	}
+
+	$id = (int)$id_string;
+	if ($id < 0) {
+		return PrepareResult::PREPARE_NEGATIVE_ID;
+	}
+	if (strlen($username) > COLUMN_USERNAME_SIZE) {
+		return PrepareResult::PREPARE_STRING_TOO_LONG;
+	}
+	if (strlen($email) > COLUMN_EMAIL_SIZE) {
+		return PrepareResult::PREPARE_STRING_TOO_LONG;
+	}
+	$statement->row_to_insert->id = $id;
+	$statement->row_to_insert->username = $username;
+	$statement->row_to_insert->email = $email;
+
+	return PrepareResult::PREPARE_SUCCESS;
+}
+
 function prepare_statement(InputBuffer $input_buffer, Statement $statement): PrepareResult {
 	if (substr($input_buffer->buffer, 0, 6) === "insert") {
-		$statement->type = StatementType::STATEMENT_INSERT;
-		$args_assigned = sscanf($input_buffer->buffer, 
-								"insert %d %s %s", 
-								$statement->row_to_insert->id,
-								$statement->row_to_insert->username,
-								$statement->row_to_insert->email);
-		if ($args_assigned < 3) {
-			return PrepareResult::PREPARE_SYNTAX_ERROR;
-		}
-		return PrepareResult::PREPARE_SUCCESS;
+		return prepare_insert($input_buffer, $statement);
 	}
 	if ($input_buffer->buffer === "select") {
 		$statement->type = StatementType::STATEMENT_SELECT;
@@ -256,6 +278,12 @@ while (true) {
 	switch (prepare_statement($input_buffer, $statement)) {
 		case PrepareResult::PREPARE_SUCCESS:
 			break;
+		case PrepareResult::PREPARE_NEGATIVE_ID:
+			echo "ID must be positive.", PHP_EOL;
+			continue 2;
+		case PrepareResult::PREPARE_STRING_TOO_LONG:
+			echo "String is too long.", PHP_EOL;
+			continue 2;
 		case PrepareResult::PREPARE_SYNTAX_ERROR:
 			echo "Syntax error. Could not parse statment.", PHP_EOL;
 			continue 2;
