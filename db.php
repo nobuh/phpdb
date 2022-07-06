@@ -84,18 +84,86 @@ class Pager
 {
 	public $file_descriptor;
 	public int $file_length;
-	public array $pages;
+	public ?array $pages;
 
-	public function __construct($file_descriptor, int $file_length) {
-		$this->file_descriptor = $file_descriptor;
-		$this->file_length = $file_length;
+	public function __construct(string $filename) {
+		$fd = fopen($filename, "c+");
+		if ($fd === false) {
+			echo "Unable to open file", PHP_EOL;
+			exit(EXIT_FAILURE);
+		}
+		$this->file_descriptor = $fd;
+		$fstat = fstat($fd);
+		$this->file_length = $fstat['size'];
+	}
+
+	public function get_page(int $page_num): mixed {
+		if ($page_num > TABLE_MAX_PAGES) {
+			echo "Tried to fetch page number out of bounds. ", $page_num, " > ", TABLE_MAX_PAGES;
+			exit(EXIT_FAILURE);
+		}
+	
+		if (!isset($this->pages[$page_num])) {
+			$page = fopen("php://temp", "r+");
+			$num_pages = floor($this->file_length / PAGE_SIZE);
+			
+			// We might save a partial page at the end of the file
+			if ($this->file_length % PAGE_SIZE) {
+				$num_pages += 1;
+			}
+			
+			if ($page_num <= $num_pages) {
+				fseek($this->file_descriptor, $page_num * PAGE_SIZE, SEEK_SET);
+				$buffer = fread($this->file_descriptor, PAGE_SIZE);
+				$bytes_read = fwrite($page, $buffer);
+				if ($bytes_read === false) {
+					printf("Error reading file: %d\n", $bytes_read);
+					exit(EXIT_FAILURE);
+				}
+			}
+			
+			$this->pages[$page_num] = $page;
+		}
+		
+		return $this->pages[$page_num];
+	}
+
+	public function flush(int $page_num, int $size): void {
+		if (!isset($this->pages[$page_num])) {
+			printf("Tried to flush null page\n");
+			exit(EXIT_FAILURE);
+		}
+
+		$offset = fseek($this->file_descriptor, $page_num * PAGE_SIZE);
+		if ($offset === false) {
+			printf("Error seeking: %d\n",);
+		exit(EXIT_FAILURE);
+		}
+
+		if (rewind($this->pages[$page_num])) {
+			$buffer = fread($this->pages[$page_num], $size);
+		} else {
+			printf("Error seeking: %d\n",);
+			exit(EXIT_FAILURE);
+		}
+
+		$bytes_written = fwrite($this->file_descriptor, $buffer, $size);
+		if ($bytes_written === false) {
+			printf("Error writing: %d\n", $bytes_written);
+		exit(EXIT_FAILURE);
+		}  
 	}
 }
 
 class Table
 {
-	public ?int $num_rows;
-	public ?Pager $pager;
+	public int $num_rows;
+	public Pager $pager;
+
+	public function __construct(int $num_rows, Pager $pager) {
+		$this->num_rows = $num_rows;
+		$this->pager = $pager;
+	}
 }
 
 function print_row(Row $row) {
@@ -216,37 +284,6 @@ function deserialize_row(Table $table, int $page_num, Row $destination): void {
 	$destination->email = rtrim(substr($source, EMAIL_OFFSET, EMAIL_SIZE));
 }
 
-function get_page(Pager $pager, int $page_num) {
-	if ($page_num > TABLE_MAX_PAGES) {
-		echo "Tried to fetch page number out of bounds. ", $page_num, " > ", TABLE_MAX_PAGES;
-		exit(EXIT_FAILURE);
-	}
-
-	if (!isset($pager->pages[$page_num])) {
-		$page = fopen("php://temp", "r+");
-		$num_pages = floor($pager->file_length / PAGE_SIZE);
-		
-		// We might save a partial page at the end of the file
-		if ($pager->file_length % PAGE_SIZE) {
-			$num_pages += 1;
-		}
-		
-		if ($page_num <= $num_pages) {
-			fseek($pager->file_descriptor, $page_num * PAGE_SIZE, SEEK_SET);
-			$buffer = fread($pager->file_descriptor, PAGE_SIZE);
-			$bytes_read = fwrite($page, $buffer);
-			if ($bytes_read === false) {
-				printf("Error reading file: %d\n", $bytes_read);
-				exit(EXIT_FAILURE);
-			}
-		}
-		
-		$pager->pages[$page_num] = $page;
-	}
-	
-	return $pager->pages[$page_num];
-}
-
 function db_close(Table $table): void {
 	$pager = $table->pager;
 	$num_full_pages = floor($table->num_rows / ROWS_PER_PAGE);
@@ -255,7 +292,7 @@ function db_close(Table $table): void {
 		if ($pager->pages[$i] === null) {
 			continne;
 		}
-		pager_flush($pager, $i, PAGE_SIZE);
+		$pager->flush($i, PAGE_SIZE);
 		$pager->pages[$i] = null;
 	}
 
@@ -263,7 +300,7 @@ function db_close(Table $table): void {
 	if ($num_additional_rows > 0) {
 		$page_num = $num_full_pages;
 		if ($pager->pages[$page_num] !== null) {
-			pager_flush($pager, $page_num, $num_additional_rows * ROW_SIZE);
+			$pager->flush($page_num, $num_additional_rows * ROW_SIZE);
 			$pager->pages[$page_num] = null;
 		}
 	}
@@ -285,7 +322,7 @@ function db_close(Table $table): void {
  */
 function row_slot(Table $table, int $row_num): int {
 	$page_num = floor($row_num / ROWS_PER_PAGE);
-	$page = get_page($table->pager, $page_num);
+	$page = $table->pager->get_page($page_num);
 
 	$row_offset = $row_num % ROWS_PER_PAGE;
 	$byte_offset = $row_offset * ROW_SIZE;
@@ -298,107 +335,69 @@ function row_slot(Table $table, int $row_num): int {
 	}
 }
 
-function pager_open(string $filename): Pager {
-	$fd = fopen($filename, "c+");
-
-	if ($fd === false) {
-		echo "Unable to open file", PHP_EOL;
-		exit(EXIT_FAILURE);
-	}
-
-	$fstat = fstat($fd);
-	$file_length = $fstat['size'];
-
-	$pager = new Pager($fd, $file_length);
-
-	return $pager;
-}
-
-function pager_flush(Pager $pager, int $page_num, int $size): void {
-	if ($pager->pages[$page_num] === null) {
-		printf("Tried to flush null page\n");
-		exit(EXIT_FAILURE);
-	}
-
-	$offset = fseek($pager->file_descriptor, $page_num * PAGE_SIZE);
-	if ($offset === false) {
-		printf("Error seeking: %d\n",);
-		exit(EXIT_FAILURE);
-	}
-
-	if (rewind($pager->pages[$page_num])) {
-		$buffer = fread($pager->pages[$page_num], $size);
-	} else {
-		printf("Error seeking: %d\n",);
-		exit(EXIT_FAILURE);
-	}
-
-	$bytes_written = fwrite($pager->file_descriptor, $buffer, $size);
-	if ($bytes_written === false) {
-		printf("Error writing: %d\n", $bytes_written);
-		exit(EXIT_FAILURE);
-	}  
-}
-
 function db_open(string $filename): Table {
-	$pager = pager_open($filename);
+	$pager = new Pager($filename);
 	$num_rows = floor($pager->file_length / ROW_SIZE);
-	$table = new Table();
-	$table->pager = $pager;
-	$table->num_rows = $num_rows;
-
+	$table = new Table($num_rows, $pager);
 	return $table;
 }
 
-/**
- * main
- */
+Class Main 
+{
+	public function run(string $filename):void {
+		$table = db_open($filename);
+		$input_buffer = new InputBuffer();
+	
+		while (true) {
+			print_prompt();
+			read_input($input_buffer);
+	
+			if (substr($input_buffer->buffer, 0, 1) === '.') {
+				switch (do_meta_command($input_buffer, $table)) {
+					case MetaCommandResult::META_COMMAND_SUCCESS:
+						continue 2;
+					case MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND:
+						echo "Unrecognized command ", $input_buffer->buffer, PHP_EOL;
+						continue 2;
+				}
+			}
+	
+			$statement = new Statement();
+			switch (prepare_statement($input_buffer, $statement)) {
+				case PrepareResult::PREPARE_SUCCESS:
+					break;
+				case PrepareResult::PREPARE_NEGATIVE_ID:
+					echo "ID must be positive.", PHP_EOL;
+					continue 2;
+				case PrepareResult::PREPARE_STRING_TOO_LONG:
+					echo "String is too long.", PHP_EOL;
+					continue 2;
+				case PrepareResult::PREPARE_SYNTAX_ERROR:
+					echo "Syntax error. Could not parse statment.", PHP_EOL;
+					continue 2;
+				case PrepareResult::PREPARE_UNRECOGNIZED_STATEMENT:
+					echo "Unrecognized keyword at start of ", $input_buffer->buffer, PHP_EOL;
+					continue 2;
+			}
+	
+			switch (execute_statement($statement, $table)) {
+				case ExecuteResult::EXECUTE_SUCCESS:
+					echo "Executed.", PHP_EOL;
+					break;
+				case ExecuteResult::EXECUTE_TABLE_FULL:
+					echo "Error: Table full.", PHP_EOL;
+					break;
+			}
+		}
+
+
+	}
+}
+
 if ($argc < 2) {
 	printf("Must supply a database filename.\n");
 	exit(EXIT_FAILURE);
 }
 $filename = $argv[1];
-$table = db_open($filename);
-$input_buffer = new InputBuffer();
-
-while (true) {
-	print_prompt();
-	read_input($input_buffer);
-
-	if (substr($input_buffer->buffer, 0, 1) === '.') {
-		switch (do_meta_command($input_buffer, $table)) {
-			case MetaCommandResult::META_COMMAND_SUCCESS:
-				continue 2;
-			case MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND:
-				echo "Unrecognized command ", $input_buffer->buffer, PHP_EOL;
-				continue 2;
-		}
-	}
-
-	$statement = new Statement();
-	switch (prepare_statement($input_buffer, $statement)) {
-		case PrepareResult::PREPARE_SUCCESS:
-			break;
-		case PrepareResult::PREPARE_NEGATIVE_ID:
-			echo "ID must be positive.", PHP_EOL;
-			continue 2;
-		case PrepareResult::PREPARE_STRING_TOO_LONG:
-			echo "String is too long.", PHP_EOL;
-			continue 2;
-		case PrepareResult::PREPARE_SYNTAX_ERROR:
-			echo "Syntax error. Could not parse statment.", PHP_EOL;
-			continue 2;
-		case PrepareResult::PREPARE_UNRECOGNIZED_STATEMENT:
-			echo "Unrecognized keyword at start of ", $input_buffer->buffer, PHP_EOL;
-			continue 2;
-	}
-
-	switch (execute_statement($statement, $table)) {
-		case ExecuteResult::EXECUTE_SUCCESS:
-			echo "Executed.", PHP_EOL;
-			break;
-		case ExecuteResult::EXECUTE_TABLE_FULL:
-			echo "Error: Table full.", PHP_EOL;
-			break;
-	}
-}
+$app = new Main();
+$app->run($filename);
