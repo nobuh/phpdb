@@ -60,6 +60,19 @@ class InputBuffer
 		$this->buffer_length = 0;
 		$this->input_length = 0;
 	}	
+
+    public function read_input(): void {
+        $input = fgets(STDIN);
+        $this->buffer_length = strlen($input);
+    
+        if ($input === false) {
+            echo "Error reading input", PHP_EOL;
+            exit(EXIT_FAILURE);
+        }
+    
+        $this->buffer = trim($input);
+        $this->input_length= strlen($this->buffer);
+    }
 }
 
 class Row
@@ -67,6 +80,10 @@ class Row
 	public ?int 	  $id;
 	public ?string $username;
 	public ?string $email;		
+
+    public function print_row():void {
+        printf("(%d, %s, %s)\n", $this->id, $this->username, $this->email);
+    }
 }
 
 class Statement
@@ -78,6 +95,77 @@ class Statement
 		$this->type = null;
 		$this->row_to_insert = new Row();
 	}
+
+    public function prepare_insert(InputBuffer $input_buffer): PrepareResult {
+        $this->type = StatementType::STATEMENT_INSERT;
+    
+        $keyword = strtok($input_buffer->buffer, " ");
+        $id_string = strtok(" ");
+        $username = strtok(" ");
+        $email = strtok(" ");
+    
+        if ($id_string === null || $username === null || $email === null) {
+            return PrepareResult::PREPARE_SYNTAX_ERROR;
+        }
+    
+        $id = (int)$id_string;
+        if ($id < 0) {
+            return PrepareResult::PREPARE_NEGATIVE_ID;
+        }
+        if (strlen($username) > COLUMN_USERNAME_SIZE) {
+            return PrepareResult::PREPARE_STRING_TOO_LONG;
+        }
+        if (strlen($email) > COLUMN_EMAIL_SIZE) {
+            return PrepareResult::PREPARE_STRING_TOO_LONG;
+        }
+        $this->row_to_insert->id = $id;
+        $this->row_to_insert->username = $username;
+        $this->row_to_insert->email = $email;
+    
+        return PrepareResult::PREPARE_SUCCESS;
+    }
+
+    public function prepare_statement(InputBuffer $input_buffer): PrepareResult {
+        if (substr($input_buffer->buffer, 0, 6) === "insert") {
+            return $this->prepare_insert($input_buffer);
+        }   
+        if ($input_buffer->buffer === "select") {
+            $this->type = StatementType::STATEMENT_SELECT;
+            return PrepareResult::PREPARE_SUCCESS;
+        }
+    
+        return PrepareResult::PREPARE_UNRECOGNIZED_STATEMENT;
+    }
+
+    public function execute_insert(Table $table): ExecuteResult {
+        if ($table->num_rows >= TABLE_MAX_ROWS) {
+            return ExecuteResult::EXECUTE_TABLE_FULL;
+        }
+    
+        $row_to_insert = $this->row_to_insert;
+        $table->serialize_row($row_to_insert, $table->row_slot($table->num_rows));
+        $table->num_rows += 1;
+    
+        return ExecuteResult::EXECUTE_SUCCESS;
+    }
+
+    public function execute_select(Table $table): ExecuteResult {
+        $row = new Row();
+        for ($i = 0; $i < $table->num_rows; $i++) {
+            $table->deserialize_row($table->row_slot($i), $row);
+            $row->print_row();
+        }
+        return ExecuteResult::EXECUTE_SUCCESS;
+    }
+
+    public function execute_statement(Table $table): ExecuteResult {
+        switch ($this->type) {
+            case StatementType::STATEMENT_INSERT:
+                return $this->execute_insert($table);
+            case StatementType::STATEMENT_SELECT:
+                return $this->execute_select($table);
+        }
+    }
 }
 
 class Pager
@@ -164,196 +252,107 @@ class Table
 		$this->num_rows = $num_rows;
 		$this->pager = $pager;
 	}
-}
 
-function print_row(Row $row) {
-	printf("(%d, %s, %s)\n", $row->id, $row->username, $row->email);
-}
+    public function serialize_row(Row $source, int $page_num): void {
+        $row = str_pad((string)$source->id, ID_SIZE);
+        $row .= str_pad($source->username, USERNAME_SIZE);
+        $row .= str_pad($source->email, EMAIL_SIZE);
+        if (!fwrite($this->pager->pages[$page_num], $row, ROW_SIZE)) {
+            echo "Error write to page ", $page_num, PHP_EOL;
+            exit(EXIT_FAILURE);
+        }
+    }
+    
+    public function deserialize_row(int $page_num, Row $destination): void {
+        $source = fgets($this->pager->pages[$page_num], ROW_SIZE);
+        $destination->id = (int)rtrim(substr($source, ID_OFFSET, ID_SIZE));
+        $destination->username = rtrim(substr($source, USERNAME_OFFSET, USERNAME_SIZE));
+        $destination->email = rtrim(substr($source, EMAIL_OFFSET, EMAIL_SIZE));
+    }
 
-function print_prompt(): void {
-	echo "db > ";
-}
+    public function db_close(): void {
+        $pager = $this->pager;
+        $num_full_pages = floor($this->num_rows / ROWS_PER_PAGE);
+        
+        for ($i = 0; $i < $num_full_pages; $i++) {
+            if ($pager->pages[$i] === null) {
+                continne;
+            }
+            $pager->flush($i, PAGE_SIZE);
+            $pager->pages[$i] = null;
+        }
+    
+        $num_additional_rows = $this->num_rows % ROWS_PER_PAGE;
+        if ($num_additional_rows > 0) {
+            $page_num = $num_full_pages;
+            if ($pager->pages[$page_num] !== null) {
+                $pager->flush($page_num, $num_additional_rows * ROW_SIZE);
+                $pager->pages[$page_num] = null;
+            }
+        }
+    
+        $result = fclose($pager->file_descriptor);
+        if ($result === false) {
+            printf("Error closing db file.\n");
+            exit(EXIT_FAILURE);
+        }
+        $pager = null;
+    }
 
-function read_input(InputBuffer $input_buffer): void {
-	$input = fgets(STDIN);
-	$input_buffer->buffer_length = strlen($input);
+    /**
+     * row_num に応じてページを選択し、seek を設定しておく
+     * ページファイルの番号を返す
+     * 
+     * 今は状態で渡すことになるのでポインタのように渡せないか要研究
+     */
+    function row_slot(int $row_num): int {
+        $page_num = floor($row_num / ROWS_PER_PAGE);
+        $page = $this->pager->get_page($page_num);
 
-	if ($input === false) {
-		echo "Error reading input", PHP_EOL;
-		exit(EXIT_FAILURE);
-	}
+        $row_offset = $row_num % ROWS_PER_PAGE;
+        $byte_offset = $row_offset * ROW_SIZE;
 
-	$input_buffer->buffer = trim($input);
-	$input_buffer->input_length= strlen($input_buffer->buffer);
-}
-
-function do_meta_command(InputBuffer $input_buffer, Table $table): MetaCommandResult {
-	if ($input_buffer->buffer === ".exit") {
-		db_close($table);
-		exit(EXIT_SUCCESS);
-	} else {
-		return MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND;
-	}
-}
-
-function prepare_insert(InputBuffer $input_buffer, Statement $statement): PrepareResult {
-	$statement->type = StatementType::STATEMENT_INSERT;
-
-	$keyword = strtok($input_buffer->buffer, " ");
-	$id_string = strtok(" ");
-	$username = strtok(" ");
-	$email = strtok(" ");
-
-	if ($id_string === null || $username === null || $email === null) {
-		return PrepareResult::PREPARE_SYNTAX_ERROR;
-	}
-
-	$id = (int)$id_string;
-	if ($id < 0) {
-		return PrepareResult::PREPARE_NEGATIVE_ID;
-	}
-	if (strlen($username) > COLUMN_USERNAME_SIZE) {
-		return PrepareResult::PREPARE_STRING_TOO_LONG;
-	}
-	if (strlen($email) > COLUMN_EMAIL_SIZE) {
-		return PrepareResult::PREPARE_STRING_TOO_LONG;
-	}
-	$statement->row_to_insert->id = $id;
-	$statement->row_to_insert->username = $username;
-	$statement->row_to_insert->email = $email;
-
-	return PrepareResult::PREPARE_SUCCESS;
-}
-
-function prepare_statement(InputBuffer $input_buffer, Statement $statement): PrepareResult {
-	if (substr($input_buffer->buffer, 0, 6) === "insert") {
-		return prepare_insert($input_buffer, $statement);
-	}
-	if ($input_buffer->buffer === "select") {
-		$statement->type = StatementType::STATEMENT_SELECT;
-		return PrepareResult::PREPARE_SUCCESS;
-	}
-
-	return PrepareResult::PREPARE_UNRECOGNIZED_STATEMENT;
-}
-
-function execute_insert(Statement $statement, Table $table): ExecuteResult {
-	if ($table->num_rows >= TABLE_MAX_ROWS) {
-		return ExecuteResult::EXECUTE_TABLE_FULL;
-	}
-
-	$row_to_insert = $statement->row_to_insert;
-	serialize_row($row_to_insert, $table, row_slot($table, $table->num_rows));
-	$table->num_rows += 1;
-
-	return ExecuteResult::EXECUTE_SUCCESS;
-}
-
-function execute_select(Statement $statement, Table $table): ExecuteResult {
-	$row = new Row();
-	for ($i = 0; $i < $table->num_rows; $i++) {
-		deserialize_row($table, row_slot($table, $i), $row);
-		print_row($row);
-	}
-	return ExecuteResult::EXECUTE_SUCCESS;
-}
-
-function execute_statement(Statement $statement, Table $table): ExecuteResult {
-	switch ($statement->type) {
-		case StatementType::STATEMENT_INSERT:
-			return execute_insert($statement, $table);
-		case StatementType::STATEMENT_SELECT:
-			return execute_select($statement, $table);
-	}
-}
-
-function serialize_row(Row $source, Table $table, int $page_num): void {
-	$row = str_pad((string)$source->id, ID_SIZE);
-	$row .= str_pad($source->username, USERNAME_SIZE);
-	$row .= str_pad($source->email, EMAIL_SIZE);
-	if (!fwrite($table->pager->pages[$page_num], $row, ROW_SIZE)) {
-		echo "Error write to page ", $page_num, PHP_EOL;
-		exit(EXIT_FAILURE);
-	}
-}
-
-function deserialize_row(Table $table, int $page_num, Row $destination): void {
-	$source = fgets($table->pager->pages[$page_num], ROW_SIZE);
-	$destination->id = (int)rtrim(substr($source, ID_OFFSET, ID_SIZE));
-	$destination->username = rtrim(substr($source, USERNAME_OFFSET, USERNAME_SIZE));
-	$destination->email = rtrim(substr($source, EMAIL_OFFSET, EMAIL_SIZE));
-}
-
-function db_close(Table $table): void {
-	$pager = $table->pager;
-	$num_full_pages = floor($table->num_rows / ROWS_PER_PAGE);
-	
-	for ($i = 0; $i < $num_full_pages; $i++) {
-		if ($pager->pages[$i] === null) {
-			continne;
-		}
-		$pager->flush($i, PAGE_SIZE);
-		$pager->pages[$i] = null;
-	}
-
-	$num_additional_rows = $table->num_rows % ROWS_PER_PAGE;
-	if ($num_additional_rows > 0) {
-		$page_num = $num_full_pages;
-		if ($pager->pages[$page_num] !== null) {
-			$pager->flush($page_num, $num_additional_rows * ROW_SIZE);
-			$pager->pages[$page_num] = null;
-		}
-	}
-
-	$result = fclose($pager->file_descriptor);
-	if ($result === false) {
-		printf("Error closing db file.\n");
-		exit(EXIT_FAILURE);
-	}
-	$pager = null;
-	$table = null;
-}
-
-/**
- * row_num に応じてページを選択し、seek を設定しておく
- * ページファイルの番号を返す
- * 
- * 今は状態で渡すことになるのでポインタのように渡せないか要研究
- */
-function row_slot(Table $table, int $row_num): int {
-	$page_num = floor($row_num / ROWS_PER_PAGE);
-	$page = $table->pager->get_page($page_num);
-
-	$row_offset = $row_num % ROWS_PER_PAGE;
-	$byte_offset = $row_offset * ROW_SIZE;
-
-	if (fseek($page, $byte_offset, SEEK_SET) === FSEEK_FAILED) {
-		echo "fseek failed on page ", $page_num, " row ", $row_num, " row_offset ", $row_offset, " byte_offset ", $byte_offset, PHP_EOL;
-		exit(EXIT_FAILURE);
-	} else {
-		return $page_num;
-	}
-}
-
-function db_open(string $filename): Table {
-	$pager = new Pager($filename);
-	$num_rows = floor($pager->file_length / ROW_SIZE);
-	$table = new Table($num_rows, $pager);
-	return $table;
+        if (fseek($page, $byte_offset, SEEK_SET) === FSEEK_FAILED) {
+            echo "fseek failed on page ", $page_num, " row ", $row_num, " row_offset ", $row_offset, " byte_offset ", $byte_offset, PHP_EOL;
+            exit(EXIT_FAILURE);
+        } else {
+            return $page_num;
+        }
+    }
 }
 
 Class Main 
 {
+    public function print_prompt(): void {
+        echo "db > ";
+    }
+
+    public function do_meta_command(InputBuffer $input_buffer, Table $table): MetaCommandResult {
+        if ($input_buffer->buffer === ".exit") {
+            $table->db_close();
+            exit(EXIT_SUCCESS);
+        } else {
+            return MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND;
+        }
+    }
+
+    public function db_open(string $filename): Table {
+        $pager = new Pager($filename);
+        $num_rows = floor($pager->file_length / ROW_SIZE);
+        $table = new Table($num_rows, $pager);
+        return $table;
+    }
+
 	public function run(string $filename):void {
-		$table = db_open($filename);
+		$table = $this->db_open($filename);
 		$input_buffer = new InputBuffer();
 	
 		while (true) {
-			print_prompt();
-			read_input($input_buffer);
+			$this->print_prompt();
+			$input_buffer->read_input();
 	
 			if (substr($input_buffer->buffer, 0, 1) === '.') {
-				switch (do_meta_command($input_buffer, $table)) {
+				switch ($this->do_meta_command($input_buffer, $table)) {
 					case MetaCommandResult::META_COMMAND_SUCCESS:
 						continue 2;
 					case MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND:
@@ -363,7 +362,7 @@ Class Main
 			}
 	
 			$statement = new Statement();
-			switch (prepare_statement($input_buffer, $statement)) {
+			switch ($statement->prepare_statement($input_buffer)) {
 				case PrepareResult::PREPARE_SUCCESS:
 					break;
 				case PrepareResult::PREPARE_NEGATIVE_ID:
@@ -380,7 +379,7 @@ Class Main
 					continue 2;
 			}
 	
-			switch (execute_statement($statement, $table)) {
+			switch ($statement->execute_statement($table)) {
 				case ExecuteResult::EXECUTE_SUCCESS:
 					echo "Executed.", PHP_EOL;
 					break;
@@ -389,8 +388,6 @@ Class Main
 					break;
 			}
 		}
-
-
 	}
 }
 
