@@ -144,7 +144,7 @@ class Statement
     
         $row_to_insert = $this->row_to_insert;
         $cursor = $table->table_end();
-        $table->serialize_row($row_to_insert, $cursor->cursor_value());
+        $table->serialize_row($row_to_insert, $cursor->prepare_io());
         $table->num_rows += 1;
 
         $cursor = null;    
@@ -155,7 +155,7 @@ class Statement
         $cursor = $table->table_start();
         $row = new Row();
         while (!$cursor->end_of_table) {
-            $table->deserialize_row($cursor->cursor_value(), $row);
+            $table->deserialize_row($cursor->prepare_io(), $row);
             $row->print_row();
             $cursor->cursor_advance();
         }
@@ -333,13 +333,8 @@ Class Cursor
         $this->end_of_table = $end_of_table;
     }
 
-    /**
-     * row_num に応じてページを選択し、seek を設定しておく
-     * ページファイルの番号を返す
-     * 
-     * 今は状態で渡すことになるのでポインタのように渡せないか要研究
-     */
-    public function cursor_value(): int {
+    // aka cursor_value()
+    public function prepare_io(): int {
         $page_num = floor($this->row_num / ROWS_PER_PAGE);
         $page = $this->table->pager->get_page($page_num);
 
