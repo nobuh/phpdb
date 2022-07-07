@@ -143,18 +143,24 @@ class Statement
         }
     
         $row_to_insert = $this->row_to_insert;
-        $table->serialize_row($row_to_insert, $table->row_slot($table->num_rows));
+        $cursor = $table->table_end();
+        $table->serialize_row($row_to_insert, $cursor->cursor_value());
         $table->num_rows += 1;
-    
+
+        $cursor = null;    
         return ExecuteResult::EXECUTE_SUCCESS;
     }
 
-    public function execute_select(Table $table): ExecuteResult {
+    public function execute_select(Table $table): ExecuteResult {   
+        $cursor = $table->table_start();
         $row = new Row();
-        for ($i = 0; $i < $table->num_rows; $i++) {
-            $table->deserialize_row($table->row_slot($i), $row);
+        while (!$cursor->end_of_table) {
+            $table->deserialize_row($cursor->cursor_value(), $row);
             $row->print_row();
+            $cursor->cursor_advance();
         }
+
+        $cursor = null;
         return ExecuteResult::EXECUTE_SUCCESS;
     }
 
@@ -299,17 +305,45 @@ class Table
         $pager = null;
     }
 
+    public function table_start(): Cursor {
+        if ($this->num_rows === 0) {
+            $isEnd = true;
+        } else {
+            $isEnd = false;
+        }
+        $cursor = new Cursor($this, 0, $isEnd);
+        return $cursor;
+    } 
+
+    public function table_end(): Cursor {
+        $cursor = new Cursor($this, $this->num_rows, true);
+        return $cursor;
+    }
+}
+
+Class Cursor
+{
+    public Table $table;
+    public int $row_num;
+    public bool $end_of_table;
+
+    public function __construct(Table $table, int $row_num, bool $end_of_table) {
+        $this->table = $table;
+        $this->row_num = $row_num;
+        $this->end_of_table = $end_of_table;
+    }
+
     /**
      * row_num に応じてページを選択し、seek を設定しておく
      * ページファイルの番号を返す
      * 
      * 今は状態で渡すことになるのでポインタのように渡せないか要研究
      */
-    function row_slot(int $row_num): int {
-        $page_num = floor($row_num / ROWS_PER_PAGE);
-        $page = $this->pager->get_page($page_num);
+    public function cursor_value(): int {
+        $page_num = floor($this->row_num / ROWS_PER_PAGE);
+        $page = $this->table->pager->get_page($page_num);
 
-        $row_offset = $row_num % ROWS_PER_PAGE;
+        $row_offset = $this->row_num % ROWS_PER_PAGE;
         $byte_offset = $row_offset * ROW_SIZE;
 
         if (fseek($page, $byte_offset, SEEK_SET) === FSEEK_FAILED) {
@@ -317,6 +351,13 @@ class Table
             exit(EXIT_FAILURE);
         } else {
             return $page_num;
+        }
+    }
+
+    public function cursor_advance() {
+        $this->row_num += 1;
+        if ($this->row_num >= $this->table->num_rows) {
+            $this->end_of_table = true;
         }
     }
 }
