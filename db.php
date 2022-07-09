@@ -1,9 +1,10 @@
 <?php
+namespace phpdb;
 
 const EXIT_SUCCESS = 0;
 const EXIT_FAILURE = 0;
 
-const COLUMN_ID_SIZE = 19;
+const COLUMN_ID_SIZE = 4;   // 32 bit uint
 const COLUMN_USERNAME_SIZE = 32;
 const COLUMN_EMAIL_SIZE = 255;
 
@@ -260,7 +261,8 @@ class Table
     }
 
     public function serialize_row(Row $source, int $page_num): void {
-        $row = str_pad((string)$source->id, ID_SIZE);
+        // $row = str_pad((string)$source->id, ID_SIZE);
+        $row = pack("N", $source->id);
         $row .= str_pad($source->username, USERNAME_SIZE);
         $row .= str_pad($source->email, EMAIL_SIZE);
         if (!fwrite($this->pager->pages[$page_num], $row, ROW_SIZE)) {
@@ -271,7 +273,8 @@ class Table
     
     public function deserialize_row(int $page_num, Row $destination): void {
         $source = fgets($this->pager->pages[$page_num], ROW_SIZE);
-        $destination->id = (int)rtrim(substr($source, ID_OFFSET, ID_SIZE));
+        $id = substr($source, ID_OFFSET, ID_SIZE);
+        $destination->id = unpack("N", $id)[1];
         $destination->username = rtrim(substr($source, USERNAME_OFFSET, USERNAME_SIZE));
         $destination->email = rtrim(substr($source, EMAIL_OFFSET, EMAIL_SIZE));
     }
