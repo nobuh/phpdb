@@ -497,6 +497,20 @@ function print_constants(): void
     printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
 }
 
+function print_leaf_node(mixed $node):void 
+{
+    $node = leaf_node_num_cells($node);
+    $num_cells = unpack("N", fread($node, LEAF_NODE_NUM_CELLS_SIZE))[1];
+    fseek($node, - LEAF_NODE_NUM_CELLS_SIZE, SEEK_CUR);
+    printf("leaf (size %d)\n", $num_cells);
+    for ($i = 0; $i < $num_cells; $i++) {
+        $node = leaf_node_key($node, $i);
+        $key = unpack("N", fread($node, LEAF_NODE_KEY_SIZE))[1];
+        fseek($node, - LEAF_NODE_KEY_SIZE, SEEK_CUR);
+        printf("  - %d : %d\n", $i, $key);
+    }
+}
+
 Class Main 
 {
     public function print_prompt(): void {
@@ -510,6 +524,10 @@ Class Main
         } else if ($input_buffer->buffer === ".constants") {
             printf("Constants:\n");
             print_constants();
+            return MetaCommandResult::META_COMMAND_SUCCESS;
+        } else if ($input_buffer->buffer === ".btree") {
+            printf("Tree:\n");
+            print_leaf_node($table->pager->get_page(0));
             return MetaCommandResult::META_COMMAND_SUCCESS;
         } else {
             return MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND;
