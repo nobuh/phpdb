@@ -18,8 +18,6 @@ const ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 const PAGE_SIZE = 4096;
 const TABLE_MAX_PAGES = 100;
-const ROWS_PER_PAGE = (PAGE_SIZE - PAGE_SIZE % ROW_SIZE) / ROW_SIZE;
-const TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 const FSEEK_FAILED = -1;
 
@@ -111,7 +109,8 @@ class Row
     public ?string $username;
     public ?string $email;		
 
-    public function print_row():void {
+    public function print_row():void 
+    {
         printf("(%d, %s, %s)\n", $this->id, $this->username, $this->email);
     }
 }
@@ -168,14 +167,16 @@ class Statement
     }
 
     public function execute_insert(Table $table): ExecuteResult {
-        if ($table->num_rows >= TABLE_MAX_ROWS) {
+        $node = $table->pager->get_page($table->root_page_num);
+        $buf = fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE);
+        $num_cells = unpack("N", $buf)[1];
+        if ($num_cells >= LEAF_NODE_MAX_CELLS) {
             return ExecuteResult::EXECUTE_TABLE_FULL;
         }
     
         $row_to_insert = $this->row_to_insert;
         $cursor = $table->table_end();
-        $table->serialize_row($row_to_insert, $cursor->prepare_io());
-        $table->num_rows += 1;
+        leaf_node_insert($cursor, $row_to_insert->id, $row_to_insert); 
 
         $cursor = null;    
         return ExecuteResult::EXECUTE_SUCCESS;
@@ -185,8 +186,8 @@ class Statement
         $cursor = $table->table_start();
         $row = new Row();
         while (!$cursor->end_of_table) {
-            $table->deserialize_row($cursor->prepare_io(), $row);
-            $row->print_row();
+            $table->deserialize_row($cursor->cursor_value(), $row);
+            $row->print_row();  
             $cursor->cursor_advance();
         }
 
@@ -208,6 +209,7 @@ class Pager
 {
     public $file_descriptor;
     public int $file_length;
+    public int $num_pages;
     public ?array $pages;
 
     public function __construct(string $filename) {
@@ -219,6 +221,12 @@ class Pager
         $this->file_descriptor = $fd;
         $fstat = fstat($fd);
         $this->file_length = $fstat['size'];
+        $this->num_pages = floor($this->file_length / PAGE_SIZE);
+
+        if ($this->file_length % PAGE_SIZE !== 0) {
+            printf("Db file is not a whole number of pages. Corrupt file.\n");
+            exit(EXIT_FAILURE);    
+        }
     }
 
     public function get_page(int $page_num): mixed {
@@ -229,6 +237,10 @@ class Pager
     
         if (!isset($this->pages[$page_num])) {
             $page = fopen("php://temp", "r+");
+            if (!ftruncate($page, PAGE_SIZE)) {
+                printf("Page stream clear failed");
+                exit(EXIT_FAILURE);
+            }
             $num_pages = floor($this->file_length / PAGE_SIZE);
             
             // We might save a partial page at the end of the file
@@ -236,7 +248,7 @@ class Pager
                 $num_pages += 1;
             }
             
-            if ($page_num <= $num_pages) {
+            if ($page_num < $num_pages) {
                 fseek($this->file_descriptor, $page_num * PAGE_SIZE, SEEK_SET);
                 $buffer = fread($this->file_descriptor, PAGE_SIZE);
                 $bytes_read = fwrite($page, $buffer);
@@ -245,14 +257,20 @@ class Pager
                     exit(EXIT_FAILURE);
                 }
             }
-            
+          
             $this->pages[$page_num] = $page;
+
+            if ($page_num >= $this->num_pages) {
+                $this->num_pages = $page_num + 1;
+            }
         }
-        
+
         return $this->pages[$page_num];
     }
 
-    public function flush(int $page_num, int $size): void {
+    // aka pager_flush
+    public function flush(int $page_num): void 
+    {
         if (!isset($this->pages[$page_num])) {
             printf("Tried to flush null page\n");
             exit(EXIT_FAILURE);
@@ -265,13 +283,13 @@ class Pager
         }
 
         if (rewind($this->pages[$page_num])) {
-            $buffer = fread($this->pages[$page_num], $size);
+            $buffer = fread($this->pages[$page_num], PAGE_SIZE);
         } else {
             printf("Error seeking: %d\n",);
             exit(EXIT_FAILURE);
         }
 
-        $bytes_written = fwrite($this->file_descriptor, $buffer, $size);
+        $bytes_written = fwrite($this->file_descriptor, $buffer, PAGE_SIZE);
         if ($bytes_written === false) {
             printf("Error writing: %d\n", $bytes_written);
         exit(EXIT_FAILURE);
@@ -281,52 +299,43 @@ class Pager
 
 class Table
 {
-    public int $num_rows;
     public Pager $pager;
+    public int $root_page_num;
 
-    public function __construct(int $num_rows, Pager $pager) {
-        $this->num_rows = $num_rows;
+    public function __construct(Pager $pager) {
         $this->pager = $pager;
+        $this->root_page_num = 0;
     }
 
-    public function serialize_row(Row $source, int $page_num): void {
+    public function serialize_row(Row $source, mixed $page): void {
         // $row = str_pad((string)$source->id, ID_SIZE);
         $row = pack("N", $source->id);
         $row .= str_pad($source->username, USERNAME_SIZE);
         $row .= str_pad($source->email, EMAIL_SIZE);
-        if (!fwrite($this->pager->pages[$page_num], $row, ROW_SIZE)) {
-            echo "Error write to page ", $page_num, PHP_EOL;
+        if (!fwrite($page, $row, ROW_SIZE)) {
+            echo "Error write to page ", $page, PHP_EOL;
             exit(EXIT_FAILURE);
         }
     }
     
-    public function deserialize_row(int $page_num, Row $destination): void {
-        $source = fgets($this->pager->pages[$page_num], ROW_SIZE);
+    public function deserialize_row(mixed $page, Row $destination): void {
+        $source = fgets($page, ROW_SIZE);
         $id = substr($source, ID_OFFSET, ID_SIZE);
         $destination->id = unpack("N", $id)[1];
         $destination->username = rtrim(substr($source, USERNAME_OFFSET, USERNAME_SIZE));
         $destination->email = rtrim(substr($source, EMAIL_OFFSET, EMAIL_SIZE));
     }
 
-    public function db_close(): void {
+    public function db_close(): void 
+    {
         $pager = $this->pager;
-        $num_full_pages = floor($this->num_rows / ROWS_PER_PAGE);
         
-        for ($i = 0; $i < $num_full_pages; $i++) {
+        for ($i = 0; $i < $pager->num_pages; $i++) {
             if ($pager->pages[$i] === null) {
-                continne;
+                continue;
             }
-            $pager->flush($i, PAGE_SIZE);
+            $pager->flush($i);
             $pager->pages[$i] = null;
-        }
-    
-        $num_additional_rows = $this->num_rows % ROWS_PER_PAGE;
-        if ($num_additional_rows > 0) {
-            $page_num = $num_full_pages;
-            if ($pager->pages[$page_num] !== null) {
-                $pager->flush($page_num, $num_additional_rows * ROW_SIZE);
-                $pager->pages[$page_num] = null;
-            }
         }
     
         $result = fclose($pager->file_descriptor);
@@ -338,55 +347,144 @@ class Table
     }
 
     public function table_start(): Cursor {
-        if ($this->num_rows === 0) {
-            $isEnd = true;
+        $cursor = new Cursor();
+        $cursor->table = $this;
+        $cursor->page_num = $this->root_page_num;
+        $cursor->cell_num = 0;
+
+        $root_node = $this->pager->get_page($this->root_page_num);
+        $num_cells = unpack("N", fread(leaf_node_num_cells($root_node), LEAF_NODE_NUM_CELLS_SIZE))[1];
+        if ($num_cells === 0) {
+            $cursor->end_of_table = true;
         } else {
-            $isEnd = false;
+            $cursor->end_of_table = false;
         }
-        $cursor = new Cursor($this, 0, $isEnd);
+ 
         return $cursor;
     } 
 
     public function table_end(): Cursor {
-        $cursor = new Cursor($this, $this->num_rows, true);
+        $cursor = new Cursor();
+        $cursor->table = $this;
+        $cursor->page_num = $this->root_page_num;
+
+        $root_node = $this->pager->get_page($this->root_page_num);
+        $num_cells = unpack("N", fread(leaf_node_num_cells($root_node), LEAF_NODE_NUM_CELLS_SIZE))[1];
+        $cursor->cell_num = $num_cells;
+        $cursor->end_of_table = true;
+        
         return $cursor;
     }
 }
 
 Class Cursor
 {
-    public Table $table;
-    public int $row_num;
-    public bool $end_of_table;
+    public ?Table $table;
+    public ?int $page_num;
+    public ?int $cell_num;
+    public ?bool $end_of_table;
 
-    public function __construct(Table $table, int $row_num, bool $end_of_table) {
-        $this->table = $table;
-        $this->row_num = $row_num;
-        $this->end_of_table = $end_of_table;
-    }
-
-    // aka cursor_value()
-    public function prepare_io(): int {
-        $page_num = floor($this->row_num / ROWS_PER_PAGE);
+    public function cursor_value(): mixed {
+        $page_num = $this->page_num;
         $page = $this->table->pager->get_page($page_num);
-
-        $row_offset = $this->row_num % ROWS_PER_PAGE;
-        $byte_offset = $row_offset * ROW_SIZE;
-
-        if (fseek($page, $byte_offset, SEEK_SET) === FSEEK_FAILED) {
-            echo "fseek failed on page ", $page_num, " row ", $row_num, " row_offset ", $row_offset, " byte_offset ", $byte_offset, PHP_EOL;
-            exit(EXIT_FAILURE);
-        } else {
-            return $page_num;
-        }
+        $page = leaf_node_value($page, $this->cell_num); 
+        return $page;
     }
 
-    public function cursor_advance() {
-        $this->row_num += 1;
-        if ($this->row_num >= $this->table->num_rows) {
+    public function cursor_advance() 
+    {
+        $page_num = $this->page_num;
+        $node = $this->table->pager->get_page($page_num);
+        $this->cell_num += 1;
+        $val = fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE);
+        if ($this->cell_num >= unpack("N", $val)[1]) {
             $this->end_of_table = true;
         }
     }
+}
+
+function leaf_node_num_cells(mixed $node): mixed
+{
+    //  return node + LEAF_NODE_NUM_CELLS_OFFSET;
+    $result = fseek($node, LEAF_NODE_NUM_CELLS_OFFSET, SEEK_SET);
+    if ($result === FSEEK_FAILED) {
+        printf("fseek failed on stream %s\n", $node);
+        exit(EXIT_FAILURE);
+    }
+    return $node;
+}
+
+function leaf_node_cell(mixed $node, int $cell_num): mixed
+{
+    // return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+    $offset = LEAF_NODE_HEADER_SIZE + $cell_num * LEAF_NODE_CELL_SIZE;
+    $result = fseek($node, $offset, SEEK_SET);
+    if ($result === FSEEK_FAILED) {
+        printf("fseek failed at offset %d\n", $offset);
+        exit(EXIT_FAILURE);
+    }
+    return $node;  
+}
+
+function leaf_node_key(mixed $node, int $cell_num): mixed
+{
+    return leaf_node_cell($node, $cell_num);
+}
+
+function leaf_node_value(mixed $node, int $cell_num): mixed 
+{
+    // return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
+    $seekednode = leaf_node_cell($node, $cell_num);
+    $result = fseek($seekednode, LEAF_NODE_KEY_SIZE, SEEK_CUR);
+    if ($result === FSEEK_FAILED) {
+        printf("fseek failed on %d\n", $seekednode);
+    }
+    return $seekednode;
+}
+
+function initialize_leaf_node($node): void
+{
+    $node = leaf_node_num_cells($node);
+    $data = pack("N", 0);
+    $written = fwrite($node, $data, LEAF_NODE_NUM_CELLS_SIZE);
+    if ($written === false) {
+        printf("Error writing: %d\n", $written);
+        exit(EXIT_FAILURE);
+    }
+}
+
+function leaf_node_insert(Cursor $cursor, int $key, Row $value): void
+{
+    $node = $cursor->table->pager->get_page($cursor->page_num);
+
+    $buf = fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE);    
+    $num_cells = unpack("N", $buf)[1];
+    if ($num_cells >= LEAF_NODE_MAX_CELLS) {
+        // Node full
+        printf("Need to implement splitting a leaf node.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if ($cursor->cell_num < $num_cells) {
+        // Make room for num cell
+        for ($i = $num_cells; $i > $cursor->cell_num; $i--) {
+            $buf = fread(leaf_node_cell($node, $i - 1), LEAF_NODE_CELL_SIZE);
+            fwrite(leaf_node_cell($node, $i), $buf, LEAF_NODE_CELL_SIZE);
+        }
+    }
+
+    // *(leaf_node_num_cells(node)) += 1
+    $buf = fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE);
+    $num_cells = unpack("N", $buf)[1];
+    $num_cells++;
+    fseek($node, - LEAF_NODE_NUM_CELLS_SIZE, SEEK_CUR);
+    fwrite($node, pack("N", $num_cells), LEAF_NODE_NUM_CELLS_SIZE);
+    
+    // *(leaf_node_key(node, cursor->cell_num)) = key
+    $node = leaf_node_key($node, $cursor->cell_num);
+    fwrite($node, pack("N", $key), LEAF_NODE_KEY_SIZE);
+
+    $cursor->table->serialize_row($value, leaf_node_value($node, $cursor->cell_num)); 
 }
 
 Class Main 
@@ -406,8 +504,13 @@ Class Main
 
     public function db_open(string $filename): Table {
         $pager = new Pager($filename);
-        $num_rows = floor($pager->file_length / ROW_SIZE);
-        $table = new Table($num_rows, $pager);
+        $table = new Table($pager);
+
+        if ($pager->num_pages === 0) {
+            // New database file. Initialize page 0 as leaf node.
+            $root_node = $pager->get_page(0);
+            initialize_leaf_node($root_node);
+        }
         return $table;
     }
 
