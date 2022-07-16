@@ -487,6 +487,16 @@ function leaf_node_insert(Cursor $cursor, int $key, Row $value): void
     $cursor->table->serialize_row($value, leaf_node_value($node, $cursor->cell_num)); 
 }
 
+function print_constants(): void 
+{
+    printf("ROW_SIZE: %d\n", ROW_SIZE);
+    printf("COMMON_NODE_HEADER_SIZE: %d\n", COMMON_NODE_HEADER_SIZE);
+    printf("LEAF_NODE_HEADER_SIZE: %d\n", LEAF_NODE_HEADER_SIZE);
+    printf("LEAF_NODE_CELL_SIZE: %d\n", LEAF_NODE_CELL_SIZE);
+    printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
+    printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
+}
+
 Class Main 
 {
     public function print_prompt(): void {
@@ -497,6 +507,10 @@ Class Main
         if ($input_buffer->buffer === ".exit") {
             $table->db_close();
             exit(EXIT_SUCCESS);
+        } else if ($input_buffer->buffer === ".constants") {
+            printf("Constants:\n");
+            print_constants();
+            return MetaCommandResult::META_COMMAND_SUCCESS;
         } else {
             return MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND;
         }
