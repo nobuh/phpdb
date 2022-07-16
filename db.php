@@ -50,6 +50,9 @@ const LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
 const LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
 const LEAF_NODE_MAX_CELLS = (LEAF_NODE_SPACE_FOR_CELLS - LEAF_NODE_SPACE_FOR_CELLS % LEAF_NODE_CELL_SIZE) / LEAF_NODE_CELL_SIZE;
 
+const NODE_LEAF     = 0;
+const NODE_INTERNAL = 1;
+
 enum MetaCommandResult 
 {
     case META_COMMAND_SUCCESS;
@@ -68,6 +71,7 @@ enum PrepareResult
 enum ExecuteResult
 {
     case EXECUTE_SUCCESS;
+    case EXECUTE_DUPLICATE_KEY;
     case EXECUTE_TABLE_FULL;
 }
 
@@ -175,7 +179,19 @@ class Statement
         }
     
         $row_to_insert = $this->row_to_insert;
-        $cursor = $table->table_end();
+        $key_to_insert = $row_to_insert->id;
+        $cursor = $table->table_find($key_to_insert);
+
+        if ($cursor->cell_num < $num_cells) {
+            $node = leaf_node_key($node, $cursor->cell_num);
+            $key_at_index = unpack("N", fread($node, LEAF_NODE_KEY_SIZE))[1];
+            fseek($node, - LEAF_NODE_KEY_SIZE, SEEK_CUR);
+
+            if ($key_at_index === $key_to_insert) {
+                return ExecuteResult::EXECUTE_DUPLICATE_KEY;
+            }
+        }
+
         leaf_node_insert($cursor, $row_to_insert->id, $row_to_insert); 
 
         $cursor = null;    
@@ -363,17 +379,21 @@ class Table
         return $cursor;
     } 
 
-    public function table_end(): Cursor {
-        $cursor = new Cursor();
-        $cursor->table = $this;
-        $cursor->page_num = $this->root_page_num;
+    /*
+     * Return the position of the given key.
+     * If the key is not present, return the position where it should be inserted
+     */
+    function table_find(int $key): Cursor
+    {
+        $root_page_num = $this->root_page_num;
+        $root_node = $this->pager->get_page($root_page_num);
 
-        $root_node = $this->pager->get_page($this->root_page_num);
-        $num_cells = unpack("N", fread(leaf_node_num_cells($root_node), LEAF_NODE_NUM_CELLS_SIZE))[1];
-        $cursor->cell_num = $num_cells;
-        $cursor->end_of_table = true;
-        
-        return $cursor;
+        if (get_node_type($root_node) === NODE_LEAF) {
+            return leaf_node_find($this, $root_page_num, $key);
+        } else {
+            printf("Need to implement searching an internal node\n");
+            exit(EXIT_FAILURE);
+        }
     }
 }
 
@@ -426,6 +446,23 @@ function leaf_node_cell(mixed $node, int $cell_num): mixed
     return $node;  
 }
 
+function get_node_type($node): int
+{
+    fseek($node, NODE_TYPE_OFFSET, SEEK_SET);
+    $value = unpack("C", fread($node, NODE_TYPE_SIZE))[1];
+    return $value;
+}
+
+function set_node_type($node, int $type): void
+{
+    fseek($node, NODE_TYPE_OFFSET, SEEK_SET);
+    $written = fwrite($node, pack("C", $type), NODE_TYPE_SIZE);
+    if ($written === false) {
+        printf("Error writing: %d\n", $written);
+        exit(EXIT_FAILURE);
+    }
+}
+
 function leaf_node_key(mixed $node, int $cell_num): mixed
 {
     return leaf_node_cell($node, $cell_num);
@@ -444,6 +481,7 @@ function leaf_node_value(mixed $node, int $cell_num): mixed
 
 function initialize_leaf_node($node): void
 {
+    set_node_type($node, NODE_LEAF);
     $node = leaf_node_num_cells($node);
     $data = pack("N", 0);
     $written = fwrite($node, $data, LEAF_NODE_NUM_CELLS_SIZE);
@@ -451,6 +489,41 @@ function initialize_leaf_node($node): void
         printf("Error writing: %d\n", $written);
         exit(EXIT_FAILURE);
     }
+}
+
+function leaf_node_find(Table $table, int $page_num, int $key): Cursor
+{
+    $node = $table->pager->get_page($page_num);
+    $node = leaf_node_num_cells($node);
+    $num_cells = unpack("N", fread($node, LEAF_NODE_NUM_CELLS_SIZE))[1];
+    fseek($node, - LEAF_NODE_NUM_CELLS_SIZE, SEEK_CUR);
+
+    $cursor = new Cursor();
+    $cursor->table = $table;
+    $cursor->page_num = $page_num;
+
+    // Binary search
+    $min_index = 0;
+    $one_past_max_index = $num_cells;
+    while ($one_past_max_index > $min_index) {
+        $index = floor(($min_index + $one_past_max_index) / 2);
+
+        $node = leaf_node_key($node, $index);
+        $key_at_index = unpack("N", fread($node, LEAF_NODE_KEY_SIZE))[1];
+        fseek($node, - LEAF_NODE_KEY_SIZE, SEEK_CUR);
+        if ($key === $key_at_index) {
+            $cursor->cell_num = $index;
+            return $cursor;
+        }
+        if ($key < $key_at_index) {
+            $one_past_max_index = $index;
+        } else {
+            $min_index = $index + 1;
+        }
+    }
+
+    $cursor->cell_num = $min_index;
+    return $cursor;
 }
 
 function leaf_node_insert(Cursor $cursor, int $key, Row $value): void
@@ -585,6 +658,9 @@ Class Main
             switch ($statement->execute_statement($table)) {
                 case ExecuteResult::EXECUTE_SUCCESS:
                     echo "Executed.", PHP_EOL;
+                    break;
+                case ExecuteResult::EXECUTE_DUPLICATE_KEY:
+                    printf("Error: Duplicate key.\n");
                     break;
                 case ExecuteResult::EXECUTE_TABLE_FULL:
                     echo "Error: Table full.", PHP_EOL;
