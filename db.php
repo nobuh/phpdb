@@ -409,8 +409,7 @@ class Table
         if (get_node_type($root_node) === NODE_LEAF) {
             return leaf_node_find($this, $root_page_num, $key);
         } else {
-            printf("Need to implement searching an internal node\n");
-            exit(EXIT_FAILURE);
+            return internal_node_find($this, $this->root_page_num, $key);
         }
     }
 }
@@ -742,6 +741,42 @@ function leaf_node_split_and_insert(Cursor $cursor, int $key, Row $value)
     } else {
         printf("Need to implement updating parent after split\n");
         exit(EXIT_FAILURE);
+    }
+}
+
+function internal_node_find(Table $table, int $page_num, int $key): Cursor
+{
+    $node = $table->pager->get_page($page_num);
+
+    $num_keys = unpack("N", fread(internal_node_num_keys($node), INTERNAL_NODE_NUM_KEYS_SIZE))[1];
+    fseek($node, - INTERNAL_NODE_NUM_KEYS_SIZE, SEEK_CUR);
+
+    /* Binary search to find index of child to search */
+    $min_index = 0;
+    $max_index = $num_keys; /* there is one more child than key */
+
+    while ($min_index !== $max_index) {
+        $index = floor(($min_index + $max_index) / 2);
+
+        $key_to_right = unpack("N", fread(internal_node_key($node, $index), INTERNAL_NODE_KEY_SIZE))[1];
+        fseek($node, - INTERNAL_NODE_KEY_SIZE, SEEK_CUR);
+        
+        if ($key_to_right >= $key) {
+            $max_index = $index;
+        } else {
+            $min_index = $index + 1;
+        }
+    }
+
+    $child_num = unpack("N", fread(internal_node_child($node, $min_index), INTERNAL_NODE_CHILD_SIZE))[1];
+    fseek($node, - INTERNAL_NODE_CHILD_SIZE, SEEK_CUR);
+
+    $child = $table->pager->get_page($child_num);
+    switch (get_node_type($child)) {
+    case NODE_LEAF:
+        return leaf_node_find($table, $child_num, $key);
+    case NODE_INTERNAL:
+        return internal_node_find($table, $child_num, $key);
     }
 }
 
