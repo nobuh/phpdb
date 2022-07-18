@@ -1,6 +1,8 @@
 <?php
 namespace phpdb;
 
+use Exception;
+
 const EXIT_SUCCESS = 0;
 const EXIT_FAILURE = 0;
 
@@ -52,6 +54,25 @@ const LEAF_NODE_MAX_CELLS = (LEAF_NODE_SPACE_FOR_CELLS - LEAF_NODE_SPACE_FOR_CEL
 
 const NODE_LEAF     = 0;
 const NODE_INTERNAL = 1;
+
+const LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1 - (LEAF_NODE_MAX_CELLS + 1) % 2) / 2;
+const LEAF_NODE_LEFT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT;
+
+/*
+ * Internal Node Header Layout
+ */
+const INTERNAL_NODE_NUM_KEYS_SIZE = 4;
+const INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const INTERNAL_NODE_RIGHT_CHILD_SIZE = 4;
+const INTERNAL_NODE_RIGHT_CHILD_OFFSET = INTERNAL_NODE_NUM_KEYS_OFFSET + INTERNAL_NODE_NUM_KEYS_SIZE;
+const INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KEYS_SIZE + INTERNAL_NODE_RIGHT_CHILD_SIZE;
+
+/*
+ * Internal Node Body Layout
+ */
+const INTERNAL_NODE_KEY_SIZE = 4;
+const INTERNAL_NODE_CHILD_SIZE = 4;
+const INTERNAL_NODE_CELL_SIZE = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
 
 enum MetaCommandResult 
 {
@@ -174,10 +195,7 @@ class Statement
         $node = $table->pager->get_page($table->root_page_num);
         $buf = fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE);
         $num_cells = unpack("N", $buf)[1];
-        if ($num_cells >= LEAF_NODE_MAX_CELLS) {
-            return ExecuteResult::EXECUTE_TABLE_FULL;
-        }
-    
+        
         $row_to_insert = $this->row_to_insert;
         $key_to_insert = $row_to_insert->id;
         $cursor = $table->table_find($key_to_insert);
@@ -335,7 +353,7 @@ class Table
     }
     
     public function deserialize_row(mixed $page, Row $destination): void {
-        $source = fgets($page, ROW_SIZE);
+        $source = fread($page, ROW_SIZE);
         $id = substr($source, ID_OFFSET, ID_SIZE);
         $destination->id = unpack("N", $id)[1];
         $destination->username = rtrim(substr($source, USERNAME_OFFSET, USERNAME_SIZE));
@@ -423,6 +441,78 @@ Class Cursor
     }
 }
 
+function internal_node_num_keys(mixed $node): mixed 
+{
+    // return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
+    $result = fseek($node, INTERNAL_NODE_NUM_KEYS_OFFSET, SEEK_SET);
+    if ($result === FSEEK_FAILED) {
+        printf("fseek failed on stream %s\n", $node);
+        exit(EXIT_FAILURE);
+    }
+    return $node;
+}
+
+function internal_node_right_child(mixed $node): mixed 
+{
+    // return node + INTERNAL_NODE_RIGHT_CHILD_OFFSET;
+    $result = fseek($node, INTERNAL_NODE_RIGHT_CHILD_OFFSET, SEEK_SET);
+    if ($result === FSEEK_FAILED) {
+        printf("fseek failed on stream %s\n", $node);
+        exit(EXIT_FAILURE);
+    }
+    return $node;
+}
+
+function internal_node_cell(mixed $node, int $cell_num): mixed 
+{
+    // return node + INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE;
+    $offset = INTERNAL_NODE_HEADER_SIZE + $cell_num * INTERNAL_NODE_CELL_SIZE;
+    $result = fseek($node, $offset, SEEK_SET);
+    if ($result === FSEEK_FAILED) {
+        printf("internal_node_cell fseek failed at offset %d cell_num %d\n", $offset, $cell_num);
+        exit(EXIT_FAILURE);
+    }
+    return $node;  
+}
+
+function internal_node_child(mixed $node, int $child_num): mixed 
+{
+    $num_keys = unpack("N", fread(internal_node_num_keys($node), INTERNAL_NODE_NUM_KEYS_SIZE))[1];
+    if ($child_num > $num_keys) {
+        printf("Tried to access child_num %d > num_keys %d\n", $child_num, $num_keys);
+        exit(EXIT_FAILURE);
+    } else if ($child_num == $num_keys) {
+        return internal_node_right_child($node);
+    } else {
+        return internal_node_cell($node, $child_num);
+    }
+}
+
+function internal_node_key(mixed $node, int $key_num): mixed 
+{
+    // return internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
+    $seekednode = internal_node_cell($node, $key_num);
+    $result = fseek($seekednode, INTERNAL_NODE_CHILD_SIZE, SEEK_CUR);
+    if ($result === FSEEK_FAILED) {
+        printf("fseek failed on %d\n", $seekednode);
+    }
+    return $seekednode;
+}
+
+function get_node_max_key(mixed $node): int 
+{
+    switch (get_node_type($node)) {
+        case NODE_INTERNAL:
+            $k = unpack("N", fread(internal_node_num_keys($node), INTERNAL_NODE_NUM_KEYS_SIZE))[1];
+            fseek($node, - INTERNAL_NODE_NUM_KEYS_SIZE);
+            return unpack("N", fread(internal_node_key($node, $k - 1), INTERNAL_NODE_KEY_SIZE))[1];
+        case NODE_LEAF:
+            $k = unpack("N", fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE))[1];
+            fseek($node, - LEAF_NODE_NUM_CELLS_SIZE);
+            return unpack("N", fread(leaf_node_key($node, $k - 1), LEAF_NODE_KEY_SIZE))[1];
+    }
+}
+
 function leaf_node_num_cells(mixed $node): mixed
 {
     //  return node + LEAF_NODE_NUM_CELLS_OFFSET;
@@ -440,7 +530,8 @@ function leaf_node_cell(mixed $node, int $cell_num): mixed
     $offset = LEAF_NODE_HEADER_SIZE + $cell_num * LEAF_NODE_CELL_SIZE;
     $result = fseek($node, $offset, SEEK_SET);
     if ($result === FSEEK_FAILED) {
-        printf("fseek failed at offset %d\n", $offset);
+        printf("leaf_node_cell fseek failed at offset %d cell_num %d\n", $offset, $cell_num);
+        throw new Exception();
         exit(EXIT_FAILURE);
     }
     return $node;  
@@ -459,6 +550,28 @@ function set_node_type($node, int $type): void
     $written = fwrite($node, pack("C", $type), NODE_TYPE_SIZE);
     if ($written === false) {
         printf("Error writing: %d\n", $written);
+        exit(EXIT_FAILURE);
+    }
+}
+
+function is_node_root(mixed $node): bool 
+{
+    fseek($node, IS_ROOT_OFFSET, SEEK_SET);
+    $value = unpack("C", fread($node, IS_ROOT_SIZE))[1];
+    return (bool)$value;
+}
+
+function set_node_root($node, bool $is_root): void
+{
+    fseek($node, IS_ROOT_OFFSET, SEEK_SET);
+    $written = fwrite($node, pack("C", (int)$is_root));
+    if ($written === false) {
+        printf("Error writing: %d\n", $written);
+        exit(EXIT_FAILURE);
+    }
+
+    if (is_node_root($node) !== $is_root) {
+        printf("set_node_root failed\n");
         exit(EXIT_FAILURE);
     }
 }
@@ -482,9 +595,23 @@ function leaf_node_value(mixed $node, int $cell_num): mixed
 function initialize_leaf_node($node): void
 {
     set_node_type($node, NODE_LEAF);
+    set_node_root($node, false);
     $node = leaf_node_num_cells($node);
     $data = pack("N", 0);
     $written = fwrite($node, $data, LEAF_NODE_NUM_CELLS_SIZE);
+    if ($written === false) {
+        printf("Error writing: %d\n", $written);
+        exit(EXIT_FAILURE);
+    }
+}
+
+function initialize_internal_node(mixed $node) 
+{
+    set_node_type($node, NODE_INTERNAL);
+    set_node_root($node, false);
+    $node = internal_node_num_keys($node);
+    $data = pack("N", 0);
+    $written = fwrite($node, $data, INTERNAL_NODE_NUM_KEYS_SIZE);
     if ($written === false) {
         printf("Error writing: %d\n", $written);
         exit(EXIT_FAILURE);
@@ -532,10 +659,10 @@ function leaf_node_insert(Cursor $cursor, int $key, Row $value): void
 
     $buf = fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE);    
     $num_cells = unpack("N", $buf)[1];
+
     if ($num_cells >= LEAF_NODE_MAX_CELLS) {
-        // Node full
-        printf("Need to implement splitting a leaf node.\n");
-        exit(EXIT_FAILURE);
+        leaf_node_split_and_insert($cursor, $key, $value);
+        return;
     }
 
     if ($cursor->cell_num < $num_cells) {
@@ -558,6 +685,120 @@ function leaf_node_insert(Cursor $cursor, int $key, Row $value): void
     fwrite($node, pack("N", $key), LEAF_NODE_KEY_SIZE);
 
     $cursor->table->serialize_row($value, leaf_node_value($node, $cursor->cell_num)); 
+}
+
+function leaf_node_split_and_insert(Cursor $cursor, int $key, Row $value) 
+{
+    /*
+     * Create a new node and move half the cells over.
+     * Insert the new value in one of the two nodes.
+     * Update parent or create a new parent.
+     */
+    $old_node = $cursor->table->pager->get_page($cursor->page_num);
+    $new_page_num = get_unused_page_num($cursor->table->pager);
+    $new_node = $cursor->table->pager->get_page($new_page_num);
+    initialize_leaf_node($new_node);
+
+    /*
+     * All existing keys plus new key should be divided
+     * evenly between old (left) and new (right) nodes.
+     * Starting from the right, move each key to correct position.
+     */
+    for ($i = LEAF_NODE_MAX_CELLS; $i >= 0; $i--) {
+        if ($i >= LEAF_NODE_LEFT_SPLIT_COUNT) {
+            $destination_node = $new_node;
+        } else {
+            $destination_node = $old_node;
+        }
+        $index_within_node = $i % LEAF_NODE_LEFT_SPLIT_COUNT;
+
+        $destination = leaf_node_cell($destination_node, $index_within_node);
+
+        if ($i === $cursor->cell_num) {
+            $cursor->table->serialize_row($value, $destination);
+        } else if ($i > $cursor->cell_num) {
+            // memcpy(destination, leaf_node_cell(old_node, i - 1), LEAF_NODE_CELL_SIZE);
+            $buf = fread(leaf_node_cell($old_node, $i - 1), LEAF_NODE_CELL_SIZE);
+            fseek($old_node, - LEAF_NODE_CELL_SIZE);
+            fwrite($destination, $buf, LEAF_NODE_CELL_SIZE);
+        } else {
+            // memcpy(destination, leaf_node_cell(old_node, i), LEAF_NODE_CELL_SIZE);
+            $buf = fread(leaf_node_cell($old_node, $i), LEAF_NODE_CELL_SIZE);
+            fseek($old_node, - LEAF_NODE_CELL_SIZE);
+            fwrite($destination, $buf, LEAF_NODE_CELL_SIZE);
+        }
+    }
+
+    /* Update cell count on both leaf nodes */
+    // *(leaf_node_num_cells(old_node)) = LEAF_NODE_LEFT_SPLIT_COUNT;
+    // *(leaf_node_num_cells(new_node)) = LEAF_NODE_RIGHT_SPLIT_COUNT;
+    $buf = pack("N", LEAF_NODE_LEFT_SPLIT_COUNT);
+    fwrite(leaf_node_num_cells($old_node), $buf, LEAF_NODE_NUM_CELLS_SIZE);
+    $buf = pack("N", LEAF_NODE_RIGHT_SPLIT_COUNT);
+    fwrite(leaf_node_num_cells($new_node), $buf, LEAF_NODE_NUM_CELLS_SIZE);
+    
+    if (is_node_root($old_node)) {
+        return create_new_root($cursor->table, $new_page_num);
+    } else {
+        printf("Need to implement updating parent after split\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+function create_new_root(Table $table, int $right_child_page_num) 
+{
+    /*
+     * Handle splitting the root.
+     * Old root copied to new page, becomes left child.
+     * Address of right child passed in.
+     * Re-initialize root page to contain the new root node.
+     * New root node points to two children.
+     */
+    $root = $table->pager->get_page($table->root_page_num);
+    //$right_child = $table->pager->get_page($right_child_page_num);
+    $left_child_page_num = get_unused_page_num($table->pager);
+    $left_child = $table->pager->get_page($left_child_page_num);
+
+    /* Left child has data copied from old root */
+    fseek($root, 0, SEEK_SET);
+    $buf = fread($root, PAGE_SIZE);
+    fseek($left_child, 0, SEEK_SET);
+    fwrite($left_child, $buf, PAGE_SIZE);
+    set_node_root($left_child, false);
+
+    /* Root node is a new internal node with one key and two children */
+    initialize_internal_node($root);
+    set_node_root($root, true);
+    $bytes = fwrite(internal_node_num_keys($root), pack("N", 1), INTERNAL_NODE_NUM_KEYS_SIZE);
+    if ($bytes === false) {
+        printf("fwrite failed\n");
+        exit(EXIT_FAILURE);
+    }
+    $bytes = fwrite(internal_node_child($root, 0), pack("N", $left_child_page_num), INTERNAL_NODE_CHILD_SIZE);
+    if ($bytes === false) {
+        printf("fwrite failed\n");
+        exit(EXIT_FAILURE);
+    }
+    $left_child_max_key = get_node_max_key($left_child);
+    $bytes = fwrite(internal_node_key($root, 0), pack("N", $left_child_max_key), INTERNAL_NODE_KEY_SIZE);
+    if ($bytes === false) {
+        printf("fwrite failed\n");
+        exit(EXIT_FAILURE);
+    }
+    $bytes = fwrite(internal_node_right_child($root), pack("N", $right_child_page_num), INTERNAL_NODE_RIGHT_CHILD_SIZE);
+    if ($bytes === false) {
+        printf("fwrite failed\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+/*
+ * Until we start recycling free pages, new pages will always
+ * go onto the end of the database file
+ */
+function get_unused_page_num(Pager $pager)
+{ 
+    return $pager->num_pages;
 }
 
 function print_constants(): void 
@@ -584,6 +825,46 @@ function print_leaf_node(mixed $node):void
     }
 }
 
+function indent(int $level) 
+{
+    for ($i = 0; $i < $level; $i++) {
+        printf("  ");
+    }
+}
+
+function print_tree(Pager $pager, int $page_num, int $indentation_level) 
+{
+    $node = $pager->get_page($page_num);
+
+    switch (get_node_type($node)) {
+        case (NODE_LEAF):
+            $num_keys = unpack("N", fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE))[1];
+            indent($indentation_level);
+            printf("- leaf (size %d)\n", $num_keys);
+            for ($i = 0; $i < $num_keys; $i++) {
+                indent($indentation_level + 1);
+                printf("- %d\n", unpack("N", fread(leaf_node_key($node, $i), LEAF_NODE_KEY_SIZE))[1]);
+            }
+            break;
+        case (NODE_INTERNAL):
+            $num_keys = unpack("N", fread(internal_node_num_keys($node), INTERNAL_NODE_NUM_KEYS_SIZE))[1];
+            indent($indentation_level);
+            printf("- internal (size %d)\n", $num_keys);
+            for ($i = 0; $i < $num_keys; $i++) {
+                $child = unpack("N", fread(internal_node_child($node, $i), INTERNAL_NODE_CHILD_SIZE))[1];
+                fseek($node, - INTERNAL_NODE_CHILD_SIZE);
+                print_tree($pager, $child, $indentation_level + 1);
+                indent($indentation_level + 1);
+                printf("- key %d\n", unpack("N", fread(internal_node_key($node, $i), INTERNAL_NODE_KEY_SIZE))[1]);
+                fseek($node, - INTERNAL_NODE_KEY_SIZE);
+            }
+            $child = unpack("N", fread(internal_node_right_child($node), INTERNAL_NODE_RIGHT_CHILD_SIZE))[1];
+            fseek($node, - INTERNAL_NODE_RIGHT_CHILD_SIZE);
+            print_tree($pager, $child, $indentation_level + 1);
+            break;
+        }
+}
+
 Class Main 
 {
     public function print_prompt(): void {
@@ -600,7 +881,7 @@ Class Main
             return MetaCommandResult::META_COMMAND_SUCCESS;
         } else if ($input_buffer->buffer === ".btree") {
             printf("Tree:\n");
-            print_leaf_node($table->pager->get_page(0));
+            print_tree($table->pager, 0, 0);
             return MetaCommandResult::META_COMMAND_SUCCESS;
         } else {
             return MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -615,6 +896,7 @@ Class Main
             // New database file. Initialize page 0 as leaf node.
             $root_node = $pager->get_page(0);
             initialize_leaf_node($root_node);
+            set_node_root($root_node, true);
         }
         return $table;
     }
