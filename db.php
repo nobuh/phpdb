@@ -75,6 +75,8 @@ const INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KE
 const INTERNAL_NODE_KEY_SIZE = 4;
 const INTERNAL_NODE_CHILD_SIZE = 4;
 const INTERNAL_NODE_CELL_SIZE = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
+/* Keep this small for testing */
+const INTERNAL_NODE_MAX_CELLS = 3;
 
 enum MetaCommandResult 
 {
@@ -725,9 +727,16 @@ function leaf_node_split_and_insert(Cursor $cursor, int $key, Row $value)
      * Update parent or create a new parent.
      */
     $old_node = $cursor->table->pager->get_page($cursor->page_num);
+    $old_max = get_node_max_key($old_node);
     $new_page_num = get_unused_page_num($cursor->table->pager);
     $new_node = $cursor->table->pager->get_page($new_page_num);
     initialize_leaf_node($new_node);
+
+    // +  *node_parent(new_node) = *node_parent(old_node);
+    $bytes = fwrite(node_parent($new_node), fread(node_parent($old_node), PARENT_POINTER_SIZE));
+    if ($bytes === false) {
+        throw new Exception();
+    }
 
     // *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
     $old_node = leaf_node_next_leaf($old_node);
@@ -787,19 +796,101 @@ function leaf_node_split_and_insert(Cursor $cursor, int $key, Row $value)
     if (is_node_root($old_node)) {
         return create_new_root($cursor->table, $new_page_num);
     } else {
-        printf("Need to implement updating parent after split\n");
-        exit(EXIT_FAILURE);
+        $parent_page_num = unpack("N", fread(node_parent($old_node), PARENT_POINTER_SIZE))[1];
+        $new_max = get_node_max_key($old_node);
+        $parent = $cursor->table->pager->get_page($parent_page_num);
+
+        update_internal_node_key($parent, $old_max, $new_max);
+        internal_node_insert($cursor->table, $parent_page_num, $new_page_num);
+        return;
     }
 }
 
-function internal_node_find(Table $table, int $page_num, int $key): Cursor
+function internal_node_insert(Table $table, int $parent_page_num, int $child_page_num): void 
 {
-    $node = $table->pager->get_page($page_num);
+    /*
+     * Add a new child/key pair to parent that corresponds to child
+     */
+    $parent = $table->pager->get_page($parent_page_num);
+    $child = $table->pager->get_page($child_page_num);
+    $child_max_key = get_node_max_key($child);
+    $index = internal_node_find_child($parent, $child_max_key);
 
+    $original_num_keys = unpack("N", fread(internal_node_num_keys($parent), INTERNAL_NODE_NUM_KEYS_SIZE))[1];
+    fseek($parent, - INTERNAL_NODE_NUM_KEYS_SIZE, SEEK_CUR);
+
+    $bytes = fwrite(internal_node_num_keys($parent), pack("N", $original_num_keys + 1));
+    if ($bytes === false) {
+        throw new Exception();
+    }
+
+    if ($original_num_keys >= INTERNAL_NODE_MAX_CELLS) {
+        printf("Need to implement splitting internal node\n");
+        exit(EXIT_FAILURE);
+    }
+
+    $right_child_page_num = unpack("N", fread(internal_node_right_child($parent), INTERNAL_NODE_RIGHT_CHILD_SIZE))[1];
+    $right_child = $table->pager->get_page($right_child_page_num);
+
+    if ($child_max_key > get_node_max_key($right_child)) {
+        /* Replace right child */
+
+        $bytes = fwrite(internal_node_child($parent, $original_num_keys), pack("N", $right_child_page_num));
+        fseek($parent, - INTERNAL_NODE_CHILD_SIZE, SEEK_CUR);
+        if ($bytes === false) {
+            throw new Exception();
+        }
+        
+        $bytes = fwrite(internal_node_key($parent, $original_num_keys), pack("N", get_node_max_key($right_child)));
+        fseek($parent, - INTERNAL_NODE_KEY_SIZE, SEEK_CUR);
+        if ($bytes === false) {
+            throw new Exception();
+        }
+
+        $bytes = fwrite(internal_node_right_child($parent), pack("N", $child_page_num));
+        fseek($parent, - INTERNAL_NODE_RIGHT_CHILD_SIZE, SEEK_CUR);
+        if ($bytes === false) {
+            throw new Exception();
+        }
+
+    } else {
+        /* Make room for the new cell */
+        for ($i = $original_num_keys; $i > $index; $i--) {
+            $source = fread(internal_node_cell($parent, $i - 1), INTERNAL_NODE_CELL_SIZE);
+            $destination = internal_node_cell($parent, $i);
+            $bytes = fwrite($destination, $source, INTERNAL_NODE_CELL_SIZE);
+            if ($bytes === false) {
+                throw new Exception();
+            }
+        }
+
+        $bytes = fwrite(internal_node_child($parent, $index), pack("N", $child_page_num));
+        if ($bytes === false) {
+            throw new Exception();
+        }
+
+        $bytes = fwrite(internal_node_key($parent, $index), pack("N", $child_max_key));
+        if ($bytes === false) {
+            throw new Exception();
+        }
+    }
+}
+
+function node_parent($node) 
+{ 
+    $result = fseek($node, PARENT_POINTER_OFFSET, SEEK_SET);
+    if ($result === FSEEK_FAILED) {
+        throw new Exception();
+    }
+    return $node;
+}
+
+function internal_node_find_child(mixed $node, int $key): int
+{
     $num_keys = unpack("N", fread(internal_node_num_keys($node), INTERNAL_NODE_NUM_KEYS_SIZE))[1];
     fseek($node, - INTERNAL_NODE_NUM_KEYS_SIZE, SEEK_CUR);
 
-    /* Binary search to find index of child to search */
+    /* Binary search */
     $min_index = 0;
     $max_index = $num_keys; /* there is one more child than key */
 
@@ -818,7 +909,15 @@ function internal_node_find(Table $table, int $page_num, int $key): Cursor
 
     $child_num = unpack("N", fread(internal_node_child($node, $min_index), INTERNAL_NODE_CHILD_SIZE))[1];
     fseek($node, - INTERNAL_NODE_CHILD_SIZE, SEEK_CUR);
+    return $min_index;
+}
 
+function internal_node_find(Table $table, int $page_num, int $key): Cursor
+{
+    $node = $table->pager->get_page($page_num);
+
+    $child_index = internal_node_find_child($node, $key);
+    $child_num = unpack("N", fread(internal_node_child($node, $child_index), INTERNAL_NODE_CHILD_SIZE))[1];
     $child = $table->pager->get_page($child_num);
     switch (get_node_type($child)) {
     case NODE_LEAF:
@@ -838,7 +937,7 @@ function create_new_root(Table $table, int $right_child_page_num)
      * New root node points to two children.
      */
     $root = $table->pager->get_page($table->root_page_num);
-    //$right_child = $table->pager->get_page($right_child_page_num);
+    $right_child = $table->pager->get_page($right_child_page_num);
     $left_child_page_num = get_unused_page_num($table->pager);
     $left_child = $table->pager->get_page($left_child_page_num);
 
@@ -872,6 +971,24 @@ function create_new_root(Table $table, int $right_child_page_num)
     if ($bytes === false) {
         printf("fwrite failed\n");
         exit(EXIT_FAILURE);
+    }
+    $bytes = fwrite(node_parent($left_child), pack("N", $table->root_page_num), PARENT_POINTER_SIZE);
+    if ($bytes === false) {
+        throw new Exception();
+    }
+    $bytes = fwrite(node_parent($right_child), pack("N", $table->root_page_num), PARENT_POINTER_SIZE);
+    if ($bytes === false) {
+        throw new Exception();
+    }
+
+}
+
+function update_internal_node_key(mixed $node, int $old_key, int $new_key): void 
+{
+    $old_child_index = internal_node_find_child($node, $old_key);
+    $bytes = fwrite(internal_node_key($node, $old_child_index), pack("N", $new_key));
+    if ($bytes === false) {
+        throw new Exception();
     }
 }
 
