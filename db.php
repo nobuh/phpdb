@@ -517,11 +517,11 @@ function get_node_max_key(mixed $node): int
     switch (get_node_type($node)) {
         case NODE_INTERNAL:
             $k = unpack("N", fread(internal_node_num_keys($node), INTERNAL_NODE_NUM_KEYS_SIZE))[1];
-            fseek($node, - INTERNAL_NODE_NUM_KEYS_SIZE);
+            fseek($node, - INTERNAL_NODE_NUM_KEYS_SIZE, SEEK_CUR);
             return unpack("N", fread(internal_node_key($node, $k - 1), INTERNAL_NODE_KEY_SIZE))[1];
         case NODE_LEAF:
             $k = unpack("N", fread(leaf_node_num_cells($node), LEAF_NODE_NUM_CELLS_SIZE))[1];
-            fseek($node, - LEAF_NODE_NUM_CELLS_SIZE);
+            fseek($node, - LEAF_NODE_NUM_CELLS_SIZE, SEEK_CUR);
             return unpack("N", fread(leaf_node_key($node, $k - 1), LEAF_NODE_KEY_SIZE))[1];
     }
 }
@@ -764,23 +764,28 @@ function leaf_node_split_and_insert(Cursor $cursor, int $key, Row $value)
         }
         $index_within_node = $i % LEAF_NODE_LEFT_SPLIT_COUNT;
 
-        $destination = leaf_node_cell($destination_node, $index_within_node);
+        // $destination = leaf_node_cell($destination_node, $index_within_node); 
+        // this stream handle could be corrupted by $old_node access
+        // so put below **set destination here** lines.
 
         if ($i === $cursor->cell_num) {
             $cursor->table->serialize_row($value, leaf_node_value($destination_node, $index_within_node));
             $bytes = fwrite(leaf_node_key($destination_node, $index_within_node), pack("N", $key));
+            fseek($destination_node, - LEAF_NODE_KEY_SIZE, SEEK_CUR);
             if ($bytes === false) {
                 throw new Exception();
             }
         } else if ($i > $cursor->cell_num) {
             // memcpy(destination, leaf_node_cell(old_node, i - 1), LEAF_NODE_CELL_SIZE);
             $buf = fread(leaf_node_cell($old_node, $i - 1), LEAF_NODE_CELL_SIZE);
-            fseek($old_node, - LEAF_NODE_CELL_SIZE);
+            fseek($old_node, - LEAF_NODE_CELL_SIZE, SEEK_CUR);
+            $destination = leaf_node_cell($destination_node, $index_within_node);       // **set destination here**
             fwrite($destination, $buf, LEAF_NODE_CELL_SIZE);
         } else {
             // memcpy(destination, leaf_node_cell(old_node, i), LEAF_NODE_CELL_SIZE);
             $buf = fread(leaf_node_cell($old_node, $i), LEAF_NODE_CELL_SIZE);
-            fseek($old_node, - LEAF_NODE_CELL_SIZE);
+            fseek($old_node, - LEAF_NODE_CELL_SIZE, SEEK_CUR);
+            $destination = leaf_node_cell($destination_node, $index_within_node);       // **set destination here**
             fwrite($destination, $buf, LEAF_NODE_CELL_SIZE);
         }
     }
@@ -1052,14 +1057,14 @@ function print_tree(Pager $pager, int $page_num, int $indentation_level)
             printf("- internal (size %d)\n", $num_keys);
             for ($i = 0; $i < $num_keys; $i++) {
                 $child = unpack("N", fread(internal_node_child($node, $i), INTERNAL_NODE_CHILD_SIZE))[1];
-                fseek($node, - INTERNAL_NODE_CHILD_SIZE);
+                fseek($node, - INTERNAL_NODE_CHILD_SIZE, SEEK_CUR);
                 print_tree($pager, $child, $indentation_level + 1);
                 indent($indentation_level + 1);
                 printf("- key %d\n", unpack("N", fread(internal_node_key($node, $i), INTERNAL_NODE_KEY_SIZE))[1]);
-                fseek($node, - INTERNAL_NODE_KEY_SIZE);
+                fseek($node, - INTERNAL_NODE_KEY_SIZE, SEEK_CUR);
             }
             $child = unpack("N", fread(internal_node_right_child($node), INTERNAL_NODE_RIGHT_CHILD_SIZE))[1];
-            fseek($node, - INTERNAL_NODE_RIGHT_CHILD_SIZE);
+            fseek($node, - INTERNAL_NODE_RIGHT_CHILD_SIZE, SEEK_CUR);
             print_tree($pager, $child, $indentation_level + 1);
             break;
         }
